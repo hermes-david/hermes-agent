@@ -428,8 +428,23 @@ def _reasoning_catalog_reader(slug: str):
     return None
 
 
+def _provider_profile_for_slug(slug: str):
+    """Resolve a registered ProviderProfile for an inventory row slug.
+
+    Returns None when the slug has no profile (generic fallback). Lazy so
+    provider plugin discovery only runs on the capabilities path.
+    """
+    try:
+        from providers import get_provider_profile
+
+        return get_provider_profile(slug)
+    except Exception:
+        return None
+
+
 def _apply_capabilities(rows: list[dict]) -> None:
-    """Attach a ``{model: {fast, reasoning, ...}}`` map to each provider row.
+    """Attach a ``{model: {fast, reasoning, supported_efforts, ...}}`` map to
+    each provider row.
 
     `fast` mirrors ``model_supports_fast_mode`` (the same gate the runtime
     enforces). `reasoning` comes from the models.dev catalog when known and
@@ -445,11 +460,10 @@ def _apply_capabilities(rows: list[dict]) -> None:
     parameter — a definitive negative from the provider actually serving the
     model outranks the models.dev inference.
 
-    The catalog's `supported_efforts` list is deliberately NOT forwarded: it
-    under-reports. The Portal accepts and honors levels a route doesn't
-    advertise (``z-ai/glm-5.3`` publishes ``max, high, low`` yet serves
-    ``minimal`` at its lowest thinking), so filtering the picker by that list
-    would hide levels that demonstrably work.
+    `supported_efforts` is the provider's wire-accepted effort set (via the
+    provider profile hook, falling back to the standard ladder when the
+    provider doesn't declare a subset) — lets UIs advertise exactly what the
+    transport will honor.
     """
     from hermes_cli.models import model_supports_fast_mode
 
@@ -462,6 +476,8 @@ def _apply_capabilities(rows: list[dict]) -> None:
         slug = row.get("slug") or ""
         caps: dict[str, dict[str, Any]] = {}
         read_reasoning_catalog = _reasoning_catalog_reader(slug.lower())
+
+        profile = _provider_profile_for_slug(slug)
 
         for model in row.get("models") or []:
             reasoning = True
@@ -477,6 +493,14 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+
+            supported_efforts: list[str] | None = None
+            if profile is not None:
+                try:
+                    supported_efforts = profile.supported_reasoning_efforts(model)
+                except Exception:
+                    supported_efforts = None
+            entry["supported_efforts"] = supported_efforts if reasoning else []
 
             if reasoning and read_reasoning_catalog is not None:
                 try:

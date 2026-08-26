@@ -1888,6 +1888,28 @@ def _discover_all_plugins() -> list:
     ):
         _scan_level(base, source, skip, "", 0, seen)
 
+    # Profile mode: the active home is <root>/profiles/<name>, whose own
+    # plugins/ dir is usually empty — user plugins live in the SHARED root's
+    # plugins/ dir. Scan the shared root first, then the profile home, so a
+    # profile-local copy of a same-named plugin stays authoritative (the
+    # second _scan_level call below overwrites same-key entries), matching
+    # PluginManager._collect_directory_manifests and #87197. In non-profile
+    # mode the two paths are identical and the extra scan is a no-op.
+    profile_plugins_dir = _plugins_dir()
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        shared_root = get_default_hermes_root() / "plugins"
+    except Exception:
+        shared_root = None
+    if (
+        shared_root is not None
+        and shared_root.resolve(strict=False)
+        != profile_plugins_dir.resolve(strict=False)
+    ):
+        _scan_level(shared_root, "user", set(), "", 0, seen)
+        _scan_level(profile_plugins_dir, "user", set(), "", 0, seen)
+
     # Entry-point plugins (installed as Python packages; no plugin directory).
     for name, version, description, path in _discover_entrypoint_plugins():
         seen[name] = (name, version, description, "entrypoint", path, name)

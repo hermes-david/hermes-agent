@@ -913,6 +913,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_ctx.add_argument("task_id")
 
+    # --- fork --- (interactive fork-resume of a worker's last run)
+    p_fork = sub.add_parser(
+        "fork",
+        help="Fork a task's last worker run into a NEW interactive session "
+             "seeded with the worker context + log tail. Releases any active "
+             "claim first. Use --no-spawn to build and print the seed "
+             "without launching a chat.",
+    )
+    p_fork.add_argument("task_id")
+    p_fork.add_argument(
+        "--tail", type=int, default=None, metavar="BYTES",
+        help="Worker-log tail size for the seed in bytes "
+             "(default: %d)" % kb._FORK_LOG_TAIL_BYTES_DEFAULT,
+    )
+    p_fork.add_argument(
+        "--profile", default=None,
+        help="Profile to fork as (default: the task's assignee). Controls "
+             "which profile's state.db receives the new session row.",
+    )
+    p_fork.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Build the fork seed and print it as JSON without creating a "
+             "session or launching a chat. Useful for testing and for UI "
+             "integrations that spawn the chat themselves.",
+    )
+
     # --- specify --- (triage → todo via auxiliary LLM)
     p_specify = sub.add_parser(
         "specify",
@@ -1148,6 +1175,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "context":  _cmd_context,
+            "fork":     _cmd_fork,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
@@ -1206,6 +1234,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "heartbeat",
     "notify-subscribe",
     "notify-unsubscribe",
+    "fork",
     "specify",
     "decompose",
     "gc",
@@ -3059,6 +3088,168 @@ def _cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_fork(args: argparse.Namespace) -> int:
+    """Fork a task's last worker run into a NEW interactive session.
+
+    Sequence (per fork-resume-design.md):
+      1. release_task_claim — clear any active claim so the dispatcher's
+         protocol-violation guard cannot fire on the next tick.
+      2. find_last_run_session — discover the worker's session id (for
+         reference/logging; the fork never resumes it).
+      3. build_fork_prompt — worker context + log tail as the seed.
+      4. create_fork_session — a fresh `cli`-source session seeded with the
+         prompt, then return/print its id.
+
+    The spawned chat runs as a FOREGROUND subprocess (the user interacts
+    with it). Its env deliberately does NOT set HERMES_SESSION_SOURCE=kanban
+    — the forked session is a visible `cli` session, not a filtered worker
+    session.
+    """
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            print(f"kanban: no such task: {args.task_id}", file=sys.stderr)
+            return 1
+
+        claim = kb.release_task_claim(conn, args.task_id)
+
+        tail_bytes = (
+            args.tail if getattr(args, "tail", None) is not None
+            else kb._FORK_LOG_TAIL_BYTES_DEFAULT
+        )
+        prompt = kb.build_fork_prompt(
+            conn, args.task_id,
+            log_tail_bytes=tail_bytes,
+            board=getattr(args, "board", None),
+        )
+
+        if getattr(args, "no_spawn", False):
+            print(json.dumps({
+                "session_id": None,
+                "prompt": prompt.prompt,
+                "has_log_tail": prompt.has_log_tail,
+                "worker_session_id": (
+                    prompt.session_ref.session_id if prompt.session_ref else None
+                ),
+                "claim": claim.action,
+            }, indent=2, ensure_ascii=False))
+            return 0
+
+        assignee = getattr(args, "profile", None) or task.assignee
+        if not assignee:
+            print(
+                "kanban: task has no assignee; pass --profile <name> to fork as",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Fail fast when the fork target profile doesn't exist. Without this
+        # guard, create_fork_session would silently fall back to the default
+        # profile's state.db and the spawned `hermes -p <name> chat` would
+        # then die inside the child with a confusing profile error.
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(assignee)
+        try:
+            resolve_profile_env(profile_arg)
+        except Exception as exc:
+            print(
+                f"kanban: assignee profile {profile_arg!r} is not resolvable: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        new_session_id = kb.create_fork_session(
+            conn, args.task_id,
+            log_tail_bytes=tail_bytes,
+            board=getattr(args, "board", None),
+            profile=assignee,
+        )
+        if not new_session_id:
+            print(
+                "kanban: fork failed — could not create the forked session "
+                "(see errors.log)",
+                file=sys.stderr,
+            )
+            return 1
+
+    if prompt.session_ref:
+        print(
+            f"Forked {args.task_id} from worker session "
+            f"{prompt.session_ref.session_id} → new session {new_session_id}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Forked {args.task_id} (no prior worker session found) → "
+            f"new session {new_session_id}",
+            file=sys.stderr,
+        )
+
+    from hermes_cli.profiles import normalize_profile_name
+
+    profile_arg = normalize_profile_name(assignee)
+    env = dict(os.environ)
+    # The forked session is a first-class interactive cli session. Never
+    # tag it as a worker session: HERMES_SESSION_SOURCE=kanban would make
+    # it invisible in every session browser (same filter that hides real
+    # workers), defeating the whole point of the fork.
+    env.pop("HERMES_SESSION_SOURCE", None)
+    # Any inherited worker-scoped pins belong to the original headless run;
+    # drop them so the forked chat runs like a normal interactive session.
+    for key in (
+        "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+        "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    ):
+        env.pop(key, None)
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except Exception:
+        pass
+    if task.workspace_path and os.path.isdir(task.workspace_path):
+        env["TERMINAL_CWD"] = task.workspace_path
+
+    import subprocess
+
+    # `-c <id>` resumes the pre-created session so the user immediately sees
+    # the seed prompt and the conversation history. The session's own
+    # cwd was stamped at creation; --no-restore-cwd keeps this subprocess
+    # anchored in the caller's current directory.
+    cmd = [
+        *kb._resolve_hermes_argv(),
+        "-p", profile_arg,
+        "--cli",
+        "chat",
+        "-c", new_session_id,
+        "--no-restore-cwd",
+    ]
+    if task.model_override:
+        cmd.extend(["-m", task.model_override])
+        if task.provider_override:
+            cmd.extend(["--provider", task.provider_override])
+    try:
+        proc = subprocess.run(
+            cmd, env=env, check=False,
+            cwd=(
+                task.workspace_path
+                if task.workspace_path and os.path.isdir(task.workspace_path)
+                else None
+            ),
+        )
+    except OSError as exc:
+        print(
+            f"kanban: failed to launch forked chat: {exc}\n"
+            f"  The forked session {new_session_id} was created and seeded — "
+            f"open it with: hermes -p {profile_arg} chat -c {new_session_id}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0 if proc.returncode == 0 else proc.returncode
+
+
 def _cmd_specify(args: argparse.Namespace) -> int:
     """Flesh out a triage task (or all of them) via auxiliary LLM,
     then promote to todo. Thin wrapper over ``kanban_specify``."""
@@ -3356,6 +3547,7 @@ Common subcommands:
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
+  `fork <id>`           Fork last run into a new interactive session
   `runs <id>`           Attempt history
   `log <id>`            Worker log
 

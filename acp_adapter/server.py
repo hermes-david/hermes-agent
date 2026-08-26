@@ -1594,7 +1594,13 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        # create_session and _build_model_state do synchronous blocking work
+        # (AIAgent.__init__: credential pool, Mnemosyne, ContextPilot;
+        # _build_model_state: model enumeration). On Windows this blocks the
+        # asyncio event loop, preventing the JSON-RPC response from being
+        # flushed to stdout. Run the blocking work in a worker thread via
+        # asyncio.to_thread so the loop stays responsive.
+        state = await asyncio.to_thread(self.session_manager.create_session, cwd)
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
@@ -1602,7 +1608,7 @@ class HermesACPAgent(acp.Agent):
         self._schedule_usage_update(state)
         return NewSessionResponse(
             session_id=state.session_id,
-            models=self._build_model_state(state),
+            models=await asyncio.to_thread(self._build_model_state, state),
             modes=self._session_modes(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
@@ -1667,7 +1673,7 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
-            state = self.session_manager.create_session(cwd=cwd)
+            state = await asyncio.to_thread(self.session_manager.create_session, cwd)
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("Resumed session %s", state.session_id)
@@ -1686,7 +1692,7 @@ class HermesACPAgent(acp.Agent):
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
         return ResumeSessionResponse(
-            models=self._build_model_state(state),
+            models=await asyncio.to_thread(self._build_model_state, state),
             modes=self._session_modes(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
@@ -1721,7 +1727,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        state = self.session_manager.fork_session(session_id, cwd=cwd)
+        state = await asyncio.to_thread(self.session_manager.fork_session, session_id, cwd)
         new_id = state.session_id if state else ""
         if state is not None:
             await self._register_session_mcp_servers(state, mcp_servers)
@@ -1730,7 +1736,11 @@ class HermesACPAgent(acp.Agent):
             self._schedule_available_commands_update(new_id)
         return ForkSessionResponse(
             session_id=new_id,
-            models=self._build_model_state(state) if state is not None else None,
+            models=(
+                await asyncio.to_thread(self._build_model_state, state)
+                if state is not None
+                else None
+            ),
             modes=self._session_modes(state) if state is not None else None,
         )
 

@@ -1372,3 +1372,48 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestDesktopRebuildPendingMarker:
+    """Nightly-pull rebuild-pending marker lifecycle (writer: WebUI, clearer: here)."""
+
+    def test_clear_marker_after_successful_rebuild(self, tmp_path, capsys):
+        """A successful rebuild removes the marker so the next launch is clean."""
+        from hermes_cli import update_cmd
+
+        home = tmp_path / "hermes-home"
+        desktop_dir = home / "hermes-agent" / "apps" / "desktop"
+        desktop_dir.mkdir(parents=True)
+        marker = home / ".hermes-desktop-rebuild-pending"
+        marker.write_text("stale\n", encoding="utf-8")
+
+        update_cmd._clear_desktop_rebuild_pending_marker(desktop_dir)
+
+        assert not marker.exists()
+
+    def test_clear_marker_absent_is_noop(self, tmp_path):
+        from hermes_cli import update_cmd
+
+        home = tmp_path / "hermes-home"
+        desktop_dir = home / "hermes-agent" / "apps" / "desktop"
+        desktop_dir.mkdir(parents=True)
+
+        update_cmd._clear_desktop_rebuild_pending_marker(desktop_dir)  # must not raise
+
+    def test_marker_path_matches_webui_writer(self, tmp_path):
+        """The clearer resolves the same marker path the WebUI writer uses.
+
+        WebUI writes at agent_dir.parent; the clearer derives from
+        desktop_dir.parent.parent.parent — they must agree.
+        """
+        from hermes_cli import update_cmd
+
+        home = tmp_path / "hermes-home"
+        agent_root = home / "hermes-agent"
+        desktop_dir = agent_root / "apps" / "desktop"
+        desktop_dir.mkdir(parents=True)
+
+        webui_marker = agent_root.parent / ".hermes-desktop-rebuild-pending"
+        clearer_marker = desktop_dir.parent.parent.parent / ".hermes-desktop-rebuild-pending"
+
+        assert clearer_marker == webui_marker

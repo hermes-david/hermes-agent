@@ -513,6 +513,56 @@ class TestCmdList:
         cmd_list()
 
 
+class TestDiscoverAllPluginsProfileScope:
+    """_discover_all_plugins must see shared-root user plugins in profile mode.
+
+    Mirrors PluginManager._collect_directory_manifests: profile-scoped
+    processes (HERMES_HOME=<root>/profiles/<name>) scan the shared root
+    plugins/ dir first, then the profile's own plugins/ dir so a
+    profile-local copy of a same-named plugin wins.
+    """
+
+    def test_profile_mode_sees_root_user_plugins(self, tmp_path, monkeypatch):
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        plugin_dir = root / "plugins" / "eagle-eye"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            "name: eagle-eye\nversion: '1.2.0'\ndescription: test plugin\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        entries = _discover_all_plugins()
+        by_key = {e[5]: e for e in entries}
+        assert "eagle-eye" in by_key
+        assert by_key["eagle-eye"][3] == "user"
+
+    def test_profile_local_plugin_wins_over_root(self, tmp_path, monkeypatch):
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        for base in (root / "plugins", profile_home / "plugins"):
+            plugin_dir = base / "dupe"
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / "plugin.yaml").write_text(
+                "name: dupe\nversion: '1.0.0'\ndescription: dupe plugin\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        entries = _discover_all_plugins()
+        by_key = {e[5]: e for e in entries}
+        assert "dupe" in by_key
+        # The winning entry must point at the profile-local directory.
+        assert by_key["dupe"][4].resolve() == (profile_home / "plugins" / "dupe").resolve()
+
+
 # ── _copy_example_files tests ─────────────────────────────────────────────────
 
 

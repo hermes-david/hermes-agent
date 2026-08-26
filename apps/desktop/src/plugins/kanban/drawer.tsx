@@ -3,6 +3,19 @@
  * status menu + meta table, DIAGNOSTICS (the "why is this stuck" panel, with
  * reassign recovery), description (editable), result/summary, dependencies,
  * comments (+composer), activity, run history, and the worker log tail.
+ *
+ * NOTE: The WebUI has an "Open interactive session" button that switches to
+ * the task's assigned profile, opens a fresh chat, and seeds the composer with
+ * "Work kanban task <id> with me interactively...". That is NOT ported to the
+ * desktop drawer because the desktop kanban plugin is SDK-bound and lacks a
+ * seam for profile-switched new-chat + composer prefill without navigating
+ * away from the board. The SDK's `host.newChat(profile)` switches profiles but
+ * always routes to #/; there is no public `requestComposerInsert` equivalent
+ * in the SDK, and the core wiring has no kanban-aware hooks. Implementing this
+ * would require either a new SDK verb (`newChatWithDraft`) or a core-side
+ * extension, which is gated on effort per the task spec. The WebUI inline-JS
+ * path (`openKanbanInteractiveSession` in panels.js) does not translate to the
+ * desktop's React/plugin architecture.
  */
 
 import {

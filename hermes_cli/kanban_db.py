@@ -5182,6 +5182,119 @@ def reclaim_task(
     return True
 
 
+@dataclass
+class ClaimReleaseResult:
+    """Outcome of a :func:`release_task_claim` call.
+
+    ``action`` is one of:
+
+    * ``released`` — an active claim was reclaimed: the worker was
+      terminated, ``claim_lock`` / ``claim_expires`` / ``worker_pid`` were
+      cleared under a CAS guard, and the run was closed as ``reclaimed``.
+    * ``already_clear`` — no claim existed (blocked/ready/done task, or a
+      concurrent reclaim won the race first).
+    * ``no_claim`` — the task is ``running`` but has no claim (broken
+      state); there is nothing to release.
+    * ``not_found`` — no task with this id.
+    * ``reclaim_failed`` — a claim existed but :func:`reclaim_task` could
+      not clear it (e.g. the worker survived termination). The caller
+      should surface this and retry or abort.
+    """
+
+    action: str
+    prev_lock: Optional[str] = None
+    run_id: Optional[int] = None
+
+
+def release_task_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_lock: Optional[str] = None,
+    signal_fn=None,
+) -> ClaimReleaseResult:
+    """Release a task's claim safely before forking a new session.
+
+    Thin wrapper over :func:`reclaim_task`: it inspects the task's current
+    claim state and either delegates the release to ``reclaim_task`` or
+    returns a no-op result. It never duplicates the reclaim logic.
+
+    * Tasks in terminal/stopped phases (blocked, ready, done, ...) already
+      had their claim cleared by the transition path — nothing to release.
+    * Running tasks with an active claim are handed to ``reclaim_task``,
+      which terminates the worker and clears ``claim_lock`` /
+      ``claim_expires`` / ``worker_pid`` under a CAS-guarded update, then
+      closes the run as ``reclaimed``. Because the status is changed away
+      from ``running`` in the same atomic step, the dispatcher's
+      protocol-violation guard (``detect_crashed_workers``) cannot fire
+      on the next tick.
+    * ``expected_lock`` is informational only — a mismatch is logged as a
+      warning and the release proceeds. Forking is an operator action; a
+      stale or foreign lock must not block it.
+
+    The function never opens its own ``write_txn`` around the
+    ``reclaim_task`` call — ``reclaim_task`` manages its own transaction.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return ClaimReleaseResult(action="not_found")
+
+    prev_lock = row["claim_lock"]
+    if row["status"] != "running":
+        if prev_lock is None:
+            # Terminal/stopped phase with the claim already cleared —
+            # blocked-task case: block_task did it, ready/done never had one.
+            return ClaimReleaseResult(action="already_clear")
+        # Invariant-broken state (claim on a non-running task). reclaim_task
+        # handles it; there is no reason to refuse the operator.
+        _log.warning(
+            "release_task_claim(%s): status=%s still carries claim_lock=%s "
+            "— delegating to reclaim_task",
+            task_id, row["status"], prev_lock,
+        )
+        if reclaim_task(conn, task_id, signal_fn=signal_fn):
+            return ClaimReleaseResult(action="released", prev_lock=prev_lock)
+        return ClaimReleaseResult(action="reclaim_failed", prev_lock=prev_lock)
+
+    # status == 'running'
+    if prev_lock is None:
+        # Broken state: running but unclaimed. Nothing to race with —
+        # the fork can proceed.
+        _log.warning(
+            "release_task_claim(%s): task is 'running' but claim_lock is "
+            "NULL — nothing to reclaim, proceeding",
+            task_id,
+        )
+        return ClaimReleaseResult(action="no_claim")
+
+    if expected_lock is not None and expected_lock != prev_lock:
+        _log.warning(
+            "release_task_claim(%s): claim held by unexpected worker "
+            "(expected %s, got %s) — proceeding",
+            task_id, expected_lock, prev_lock,
+        )
+    run_id = _current_run_id(conn, task_id)
+    reclaimed = reclaim_task(
+        conn, task_id, reason="fork-resume", signal_fn=signal_fn,
+    )
+    if reclaimed:
+        return ClaimReleaseResult(
+            action="released", prev_lock=prev_lock, run_id=run_id,
+        )
+    # reclaim_task returned False: either a concurrent reclaim (dispatcher
+    # CAS guard) already cleared the claim, or termination failed. Re-read
+    # to disambiguate — a gone claim is success by another hand.
+    after = conn.execute(
+        "SELECT claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if after is None or after["claim_lock"] is None:
+        return ClaimReleaseResult(action="already_clear", prev_lock=prev_lock)
+    return ClaimReleaseResult(action="reclaim_failed", prev_lock=prev_lock)
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11949,6 +12062,287 @@ def read_worker_log(
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Fork-resume: session lookup, seed prompt, forked session creation
+# ---------------------------------------------------------------------------
+#
+# A "fork" turns a headless kanban worker's last run into a NEW interactive
+# `cli` session the user can open and continue. It never resumes the worker
+# session itself: worker sessions are source='kanban' and filtered out of
+# every session-browsing surface by design, and the fork seed (standard
+# spawn brief + worker log tail) is a curated summary rather than a full
+# transcript. See fork-resume-design.md in the design workspace.
+
+#: Cap on the fork prompt seed. The worker context itself is already bounded
+#: by build_worker_context's internal caps; this is a belt-and-braces clamp on
+#: the final concatenation (e.g. a pathological board with a huge comment
+#: thread) so the seed never exceeds the window the CLI is comfortable
+#: handing to a fresh session.
+_FORK_PROMPT_MAX_CHARS = 64 * 1024
+
+#: Default worker-log tail size for fork seeds (bytes).
+_FORK_LOG_TAIL_BYTES_DEFAULT = 8192
+
+
+@dataclass
+class SessionRef:
+    """Reference to a worker session discovered for a task's last run."""
+
+    session_id: str
+    run_id: Optional[int] = None  # the task_runs row this session belongs to
+    started_at: float = 0.0
+    cwd: str = ""
+
+
+@dataclass
+class ForkPrompt:
+    """Combined seed prompt for a fork-resume session."""
+
+    prompt: str
+    has_log_tail: bool
+    session_ref: Optional[SessionRef] = None
+
+
+def find_last_run_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[SessionRef]:
+    """Find the worker session id for the last completed run of a task.
+
+    Tier-1 lookup (per the fork-resume design): the assignee profile's
+    ``state.db`` is queried for the most recent ``source='kanban'`` session
+    whose ``cwd`` matches the task's ``workspace_path``. ``task_runs`` has
+    no ``session_id`` column (and ``tasks.session_id`` stores the creator's
+    session, not the worker's), so the workspace-path match is the only
+    zero-schema-change way to recover the worker's session.
+
+    Returns ``None`` (never raises) when:
+
+    * the task has no assignee or no resolved ``workspace_path``
+    * the assignee profile's ``state.db`` does not exist or cannot be
+      opened read-only (missing profile, locked DB)
+    * no ``source='kanban'`` session matches the workspace path
+
+    The state.db connection is opened read-only with a short timeout and
+    closed before returning — the fork must never block on a locked
+    state.db.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    if not task.assignee or not task.workspace_path:
+        return None
+    workspace = task.workspace_path
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(task.assignee)
+        profile_home = Path(resolve_profile_env(profile_arg))
+    except Exception:
+        _log.warning(
+            "find_last_run_session(%s): assignee profile %r not resolvable — "
+            "skipping session lookup",
+            task_id, task.assignee,
+        )
+        return None
+
+    state_db = profile_home / "state.db"
+    if not state_db.is_file():
+        _log.debug(
+            "find_last_run_session(%s): no state.db at %s", task_id, state_db,
+        )
+        return None
+
+    try:
+        sconn = sqlite3.connect(
+            state_db.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+    except Exception:
+        _log.warning(
+            "find_last_run_session(%s): cannot open %s read-only — "
+            "skipping session lookup",
+            task_id, state_db,
+        )
+        return None
+    try:
+        sconn.row_factory = sqlite3.Row
+        row = sconn.execute(
+            "SELECT id, started_at, cwd FROM sessions "
+            "WHERE source = 'kanban' AND cwd = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (workspace,),
+        ).fetchone()
+    except Exception:
+        _log.warning(
+            "find_last_run_session(%s): state.db query failed — "
+            "skipping session lookup",
+            task_id,
+        )
+        return None
+    finally:
+        try:
+            sconn.close()
+        except Exception:
+            pass
+
+    if row is None:
+        return None
+    return SessionRef(
+        session_id=row["id"],
+        started_at=float(row["started_at"]),
+        cwd=str(row["cwd"] or workspace),
+    )
+
+
+def build_fork_prompt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    log_tail_bytes: int = _FORK_LOG_TAIL_BYTES_DEFAULT,
+    board: Optional[str] = None,
+) -> ForkPrompt:
+    """Build the combined seed prompt for a fork-resume session.
+
+    The prompt is the standard spawn-time brief (``build_worker_context``)
+    plus the worker's log tail (``read_worker_log``) formatted as a
+    "Prior worker transcript" continuation block. When the log is missing
+    or empty the tail block is omitted and ``has_log_tail=False`` — the
+    fork still succeeds with a brief-only seed.
+    """
+    brief = build_worker_context(conn, task_id)
+
+    session_ref = find_last_run_session(conn, task_id, board=board)
+
+    tail = read_worker_log(task_id, tail_bytes=log_tail_bytes, board=board)
+    has_tail = bool(tail and tail.strip())
+    if has_tail:
+        sections = [
+            brief,
+            "---",
+            f"## Prior worker transcript (tail — last {log_tail_bytes} bytes)",
+            "",
+            "The following is the tail of the worker's log from its last run. "
+            "It shows what the worker actually did, what it tried, and where "
+            "it got stuck. Use it to orient yourself and continue the work "
+            "interactively.",
+            "",
+            tail.strip(),
+            "",
+            "---",
+            "",
+            "You are resuming this task interactively after a fork. The "
+            "worker above ran headlessly and was blocked or stalled. You have "
+            "the full task context above and the worker's last actions in the "
+            "transcript tail. Continue the work. When done, report your "
+            "result via the normal kanban completion path.",
+        ]
+    else:
+        sections = [
+            brief,
+            "",
+            "---",
+            "",
+            "You are resuming this task interactively after a fork. The "
+            "worker's log is empty or missing, so there is no transcript "
+            "tail to orient from. Continue the work from the task context "
+            "above. When done, report your result via the normal kanban "
+            "completion path.",
+        ]
+    prompt = "\n\n".join(sections)
+
+    # Hard cap so a pathological board can never balloon the user prompt.
+    if len(prompt) > _FORK_PROMPT_MAX_CHARS:
+        prompt = (
+            prompt[:_FORK_PROMPT_MAX_CHARS]
+            + "\n\n… [fork prompt truncated]"
+        )
+
+    return ForkPrompt(prompt=prompt, has_log_tail=has_tail, session_ref=session_ref)
+
+
+def create_fork_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    log_tail_bytes: int = _FORK_LOG_TAIL_BYTES_DEFAULT,
+    board: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> Optional[str]:
+    """Create a NEW ``cli``-source session seeded from the task's fork prompt.
+
+    Returns the new session id, or ``None`` when the seed prompt could not
+    be built (unknown task) or the session row could not be written.
+    ``profile`` optionally names the assignee whose ``state.db`` the
+    session row is written into; it defaults to the task's assignee.
+
+    The seed is stored as a user message so it is immediately visible to the
+    user and to any session browser. The session is deliberately NOT
+    resumed: the worker's session is ``source='kanban'`` and filtered from
+    all browsing surfaces; a fork is a fresh ``source='cli'`` row the user
+    can find, open, and interact with.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+
+    prompt = build_fork_prompt(conn, task_id, log_tail_bytes=log_tail_bytes, board=board)
+
+    assignee = profile or task.assignee or "default"
+    from hermes_cli.profiles import normalize_profile_name
+
+    profile_arg = normalize_profile_name(assignee)
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = Path(resolve_profile_env(profile_arg))
+    except Exception:
+        profile_home = None
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=profile_home / "state.db" if profile_home else None)
+    except Exception:
+        _log.warning(
+            "create_fork_session(%s): cannot open state.db for profile %r",
+            task_id, profile_arg,
+        )
+        return None
+
+    try:
+        new_session_id = db.create_session(
+            session_id=f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}",
+            source="cli",
+            cwd=task.workspace_path,
+        )
+        db.append_message(
+            session_id=new_session_id,
+            role="user",
+            content=prompt.prompt,
+        )
+    except Exception:
+        _log.warning(
+            "create_fork_session(%s): session creation failed", task_id,
+        )
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    _log.debug(
+        "create_fork_session(%s): forked session %s (has_log_tail=%s)",
+        task_id, new_session_id, prompt.has_log_tail,
+    )
+    return new_session_id
 
 
 # ---------------------------------------------------------------------------

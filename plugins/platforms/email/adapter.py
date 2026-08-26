@@ -51,6 +51,48 @@ from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+_EMAIL_HTML_CSS = (
+    "body{font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;"
+    "line-height:1.55;margin:0}pre{background:#f4f4f4;border:1px solid #ddd;"
+    "border-radius:4px;padding:10px;overflow-x:auto;font-size:13px}"
+    "code{background:#f4f4f4;padding:1px 4px;border-radius:3px;font-size:13px}"
+    "blockquote{border-left:3px solid #ccc;margin:8px 0;padding:4px 12px;color:#555}"
+    "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}"
+    "th{background:#eee}h1,h2,h3{color:#111}"
+)
+
+
+def _markdown_to_html(text: str) -> str:
+    """Render markdown (agent replies) to a safe HTML email body.
+
+    Falls back to a paragraph-wrapped plain-text pass when the markdown
+    renderer is unavailable, so email never fails hard on a missing dep.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    try:
+        import markdown as _md
+
+        html_body = _md.markdown(
+            body,
+            extensions=["tables", "fenced_code", "sane_lists", "nl2br"],
+            output_format="html",
+        )
+    except Exception:  # pragma: no cover - defensive fallback
+        import html as _html
+
+        html_body = "".join(
+            f"<p>{_html.escape(line)}</p>" for line in body.splitlines() if line.strip()
+        )
+    return (
+        "<html><head><meta charset='utf-8'><style>"
+        + _EMAIL_HTML_CSS
+        + "</style></head><body>"
+        + html_body
+        + "</body></html>"
+    )
+
 
 def _get_esecret(name: str, default: str = "") -> str:
     """Scope-aware ``EMAIL_*`` read with the default-profile startup fallback.
@@ -1183,7 +1225,14 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        # Plain + HTML body (markdown rendered). Clients without HTML
+        # renderers fall back to the text part.
+        if body:
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            try:
+                msg.attach(MIMEText(_markdown_to_html(body), "html", "utf-8"))
+            except Exception:
+                logger.debug("[Email] HTML body render failed, plain only", exc_info=True)
 
         smtp = self._connect_smtp()
         try:
@@ -1298,6 +1347,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
+            try:
+                msg.attach(MIMEText(_markdown_to_html(body), "html", "utf-8"))
+            except Exception:
+                logger.debug("[Email] HTML body render failed, plain only", exc_info=True)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1378,6 +1431,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
+            try:
+                msg.attach(MIMEText(_markdown_to_html(body), "html", "utf-8"))
+            except Exception:
+                logger.debug("[Email] HTML body render failed, plain only", exc_info=True)
 
         # Attach file
         p = Path(file_path)

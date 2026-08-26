@@ -15866,6 +15866,39 @@ app.whenReady().then(() => {
 
   createWindow()
 
+  // Desktop-rebuild marker hand-off: the WebUI's nightly agent-apply writes
+  // HERMES_HOME/.hermes-desktop-rebuild-pending when a git pull advanced
+  // apps/desktop/ source (a bare pull can't rebuild the running desktop).
+  // Consume it at startup: hand off to the existing update flow, which runs
+  // `hermes update` (rebuilds the bundle and clears the marker via
+  // _clear_desktop_rebuild_pending_marker) and relaunches. Normal launches
+  // have no marker and are unaffected. Fail closed: any error just logs.
+  const desktopRebuildMarker = path.join(HERMES_HOME, '.hermes-desktop-rebuild-pending')
+  if (fileExists(desktopRebuildMarker)) {
+    rememberLog('[updates] desktop-rebuild marker present — handing off to update flow')
+    void (async () => {
+      try {
+        // Fail-closed on blockers: do NOT auto-stop other venv-holding
+        // processes from a boot-time trigger (stopSafeBlockers would kill
+        // sibling Hermes processes without user consent). If the venv is
+        // blocked, applyUpdates returns {ok:false} and the marker stays in
+        // place so the next launch retries.
+        const result: any = await applyUpdates({})
+        if (result?.ok === false) {
+          rememberLog(`[updates] rebuild marker hand-off refused: ${result?.message || 'unknown'} (marker retained for next launch)`)
+        } else if (result?.manual) {
+          // No staged updater / handoff script — the marker stays in place so
+          // the next launch retries; the surfaced manual command is logged.
+          rememberLog(`[updates] rebuild marker: manual update required: ${result?.command || 'hermes update'}`)
+        } else {
+          rememberLog('[updates] desktop rebuild hand-off started')
+        }
+      } catch (err) {
+        rememberLog(`[updates] rebuild marker hand-off failed: ${(err as Error)?.message || String(err)}`)
+      }
+    })()
+  }
+
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
 

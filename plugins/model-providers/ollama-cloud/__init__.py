@@ -83,6 +83,37 @@ class OllamaCloudProfile(ProviderProfile):
 
         return {}, top_level
 
+    def supported_reasoning_efforts(self, model: str | None = None) -> list[str] | None:
+        """Ollama Cloud's accepted reasoning-effort contract.
+
+        The /v1/chat/completions endpoint accepts {low, medium, high, max,
+        none} and rejects ``minimal``/``xhigh``/``ultra`` with HTTP 400.
+        Empirically (live probing 2026-08-20), DeepSeek V4's low/medium/high
+        produce statistically indistinguishable reasoning volume — only ``max``
+        (and ``none``) are behaviorally distinct, matching the model page's
+        documented Non-Think / High / Max modes. So:
+
+        - DeepSeek V4 family → the honest 3-mode set {high, max, none}
+          (what the UI should advertise).
+        - Other models → the full wire-accepted set, since their per-tier
+          behavior is not known to collapse.
+
+        Note: this reports what the backend ACCEPTS; whether a specific model
+        supports thinking at all is resolved separately (the /api/show
+        capability probe), and callers gate on that first.
+        """
+        bare = str(model or "").strip()
+        # Strip Ollama's `:cloud` / `:<date>-cloud` suffix shapes.
+        bare = bare.split("/")[-1]
+        for suffix in (":cloud", "-cloud"):
+            if bare.endswith(suffix):
+                bare = bare[: -len(suffix)]
+                break
+        bare = bare.lower()
+        if "deepseek" in bare and "v4" in bare:
+            return ["high", "max", "none"]
+        return ["low", "medium", "high", "max", "none"]
+
 
 ollama_cloud = OllamaCloudProfile(
     name="ollama-cloud",

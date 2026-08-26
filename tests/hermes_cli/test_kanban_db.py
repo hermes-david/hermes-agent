@@ -244,6 +244,245 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+# ---------------------------------------------------------------------------
+# release_task_claim(): safe claim release before a fork-resume session.
+# Thin wrapper over reclaim_task — never duplicates the reclaim logic, and
+# must not race the dispatcher's reclaim loop (CAS guard is reclaim_task's).
+# ---------------------------------------------------------------------------
+
+
+def _claim_running_task(conn: sqlite3.Connection, *, title: str = "forkme") -> str:
+    """Create a task and put it in a running/claimed state with a worker pid."""
+    import hermes_cli.kanban_db as _kb
+
+    t = _kb.create_task(conn, title=title, assignee="a")
+    host = _kb._claimer_id().split(":", 1)[0]
+    _kb.claim_task(conn, t, claimer=f"{host}:worker")
+    _kb._set_worker_pid(conn, t, 424242)
+    return t
+
+
+def _task_row(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
+    return conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def test_release_task_claim_active_claim_delegates_to_reclaim_task(
+    kanban_home, monkeypatch,
+):
+    """A running task with an active claim must be fully reclaimed: claim,
+    expiry, pid cleared, run closed as 'reclaimed', status back to ready —
+    so the dispatcher's protocol-violation guard has nothing to fire on."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        t = _claim_running_task(conn)
+        row = _task_row(conn, t)
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
+        prev_lock = row["claim_lock"]
+        prev_run_id = row["current_run_id"]
+
+        res = _kb.release_task_claim(
+            conn, t, signal_fn=lambda _p, _s: None,
+        )
+        assert res.action == "released"
+        assert res.prev_lock == prev_lock
+        assert res.run_id == prev_run_id
+
+        row = _task_row(conn, t)
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+        assert row["worker_pid"] is None
+        assert row["current_run_id"] is None
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (prev_run_id,),
+        ).fetchone()
+        assert run["status"] == "reclaimed"
+        assert run["ended_at"] is not None
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (t,),
+        ).fetchone()
+        assert ev is not None and "fork-resume" in ev["payload"]
+
+
+def test_release_task_claim_blocked_task_is_already_clear(kanban_home):
+    """block_task already cleared the claim — the release is a no-op and
+    must NOT touch the task (no protocol-violation event either)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="blocked", assignee="a")
+        assert kb.block_task(conn, t, reason="waiting on human") is True
+        before = _task_row(conn, t)
+        assert before["status"] == "blocked"
+        assert before["claim_lock"] is None
+
+        res = kb.release_task_claim(conn, t)
+        assert res.action == "already_clear"
+        assert res.prev_lock is None
+
+        after = _task_row(conn, t)
+        assert after["status"] == "blocked"
+        assert after["claim_lock"] is None
+        assert after["worker_pid"] is None
+        # No reclaim event may exist for a never-claimed task.
+        ev = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'reclaimed'",
+            (t,),
+        ).fetchone()
+        assert ev is None
+
+
+def test_release_task_claim_ready_task_is_no_op(kanban_home):
+    """A never-claimed ready task: skip entirely, no run rows created."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh", assignee="a")
+        res = kb.release_task_claim(conn, t)
+        assert res.action == "already_clear"
+        assert res.run_id is None
+        row = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ?", (t,),
+        ).fetchone()
+        assert row is None
+
+
+def test_release_task_claim_expired_claim_still_released(kanban_home, monkeypatch):
+    """reclaim_task ignores claim_expires (it only checks claim_lock), so an
+    already-expired claim on a running task is still cleared."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        t = _claim_running_task(conn)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        res = _kb.release_task_claim(
+            conn, t, signal_fn=lambda _p, _s: None,
+        )
+        assert res.action == "released"
+        row = _task_row(conn, t)
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+
+
+def test_release_task_claim_running_without_claim_is_no_claim(kanban_home):
+    """Broken state (running but unclaimed): nothing to release; the fork can
+    proceed because there is no claim to race with."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="broken", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?", (t,),
+        )
+        res = kb.release_task_claim(conn, t)
+        assert res.action == "no_claim"
+        assert res.prev_lock is None
+        assert res.run_id is None
+
+
+def test_release_task_claim_unknown_task_is_not_found(kanban_home):
+    with kb.connect() as conn:
+        res = kb.release_task_claim(conn, "no-such-task")
+        assert res.action == "not_found"
+        assert res.prev_lock is None
+
+
+def test_release_task_claim_concurrent_reclaim_is_already_clear(
+    kanban_home, monkeypatch,
+):
+    """If the dispatcher's reclaim loop wins the race first, our reclaim_task
+    call returns False and the claim is gone — treat as already_clear, do
+    not crash."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = _claim_running_task(conn)
+        prev_lock = _task_row(conn, t)["claim_lock"]
+
+        def _dispatcher_won(conn, task_id, reason=None, signal_fn=None):
+            # The dispatcher's CAS guard already cleared the claim.
+            conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            return False
+
+        monkeypatch.setattr(_kb, "reclaim_task", _dispatcher_won)
+        res = _kb.release_task_claim(conn, t)
+        assert res.action == "already_clear"
+        assert res.prev_lock == prev_lock
+        assert _task_row(conn, t)["claim_lock"] is None
+
+
+def test_release_task_claim_reclaim_failure_is_surfaced(kanban_home, monkeypatch):
+    """If reclaim_task returns False and the claim is still present (worker
+    survived termination), the failure must be surfaced — not swallowed."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = _claim_running_task(conn)
+        prev_lock = _task_row(conn, t)["claim_lock"]
+
+        monkeypatch.setattr(_kb, "reclaim_task", lambda *a, **k: False)
+        res = _kb.release_task_claim(conn, t)
+        assert res.action == "reclaim_failed"
+        assert res.prev_lock == prev_lock
+        assert _task_row(conn, t)["claim_lock"] == prev_lock
+
+
+def test_release_task_claim_expected_lock_mismatch_warns_but_proceeds(
+    kanban_home, monkeypatch, caplog,
+):
+    """expected_lock is a logging aid, not a gate: a mismatched lock warns
+    and still releases."""
+    import logging
+
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        t = _claim_running_task(conn)
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
+            res = _kb.release_task_claim(
+                conn, t, expected_lock="someone-else:999",
+                signal_fn=lambda _p, _s: None,
+            )
+        assert res.action == "released"
+        assert "unexpected worker" in caplog.text
+        assert _task_row(conn, t)["claim_lock"] is None
+
+
+def test_release_task_claim_claim_on_non_running_task_delegates(
+    kanban_home, monkeypatch,
+):
+    """Invariant-broken state (claim on a non-running task): still delegate
+    to reclaim_task — the operator's fork should not be refused."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-claim", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = 'host:stale' "
+            "WHERE id = ?",
+            (t,),
+        )
+        res = _kb.release_task_claim(conn, t, signal_fn=lambda _p, _s: None)
+        assert res.action == "released"
+        row = _task_row(conn, t)
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+
+
 
 
 

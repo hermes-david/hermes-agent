@@ -25,7 +25,7 @@ import type {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
-import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
+import { DEFAULT_REASONING_EFFORT, REASONING_EFFORTS, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError } from '@/store/notifications'
@@ -518,13 +518,40 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   const reasoningSupported = mainCaps?.reasoning ?? true
   const fastSupported = mainCaps?.fast ?? false
 
+  // Provider-declared wire-accepted efforts for the applied model (undefined =
+  // generic ladder applies). Filters the dropdown so it never offers tiers the
+  // transport would 400 or silently drop.
+  const supportedEfforts = Array.isArray(mainCaps?.supported_efforts)
+    ? mainCaps.supported_efforts
+    : undefined
+
+  const offeredEffortValues: string[] = supportedEfforts
+    ? REASONING_EFFORT_VALUES.filter(value => value === 'none' || supportedEfforts.includes(value))
+    : [...REASONING_EFFORT_VALUES]
+
   // Hand-written `reasoning_effort: false`/`off` reaches us as boolean false
   // ("false" once stringified) — show it as Off, not an empty select.
   const rawEffort = String(getNested(config ?? {}, 'agent.reasoning_effort') ?? '')
     .trim()
     .toLowerCase()
 
-  const effortValue = rawEffort === 'false' || rawEffort === 'disabled' ? 'none' : rawEffort || DEFAULT_REASONING_EFFORT
+  const rawEffortValue = rawEffort === 'false' || rawEffort === 'disabled' ? 'none' : rawEffort || DEFAULT_REASONING_EFFORT
+
+  // Clamp a stored effort outside the model's wire set down to the nearest
+  // offered level (matching the transport's own coercion, e.g. stored `ultra`
+  // streams as `max` on Ollama Cloud DeepSeek — show `max`, not a phantom
+  // level the dropdown can't select). Falls back to the default when nothing
+  // offered matches.
+  const effortOrder = [...REASONING_EFFORTS] as string[]
+  const effortValue = offeredEffortValues.includes(rawEffortValue)
+    ? rawEffortValue
+    : [...offeredEffortValues]
+        .reverse()
+        .find(
+          value =>
+            value !== 'none' &&
+            effortOrder.indexOf(value) <= Math.max(0, effortOrder.indexOf(rawEffortValue))
+        ) ?? DEFAULT_REASONING_EFFORT
 
   const fastOn = isFastTier(getNested(config ?? {}, 'agent.service_tier'))
 
@@ -879,9 +906,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {REASONING_EFFORT_VALUES.map(value => (
+                    {offeredEffortValues.map(value => (
                       <SelectItem key={value} value={value}>
-                        {value === 'none' ? m.reasoningOff : t.shell.modelOptions[value]}
+                        {value === 'none'
+                          ? m.reasoningOff
+                          : t.shell.modelOptions[value as keyof typeof t.shell.modelOptions]}
                       </SelectItem>
                     ))}
                   </SelectContent>

@@ -5755,6 +5755,28 @@ def _desktop_app_present(desktop_dir: Path) -> bool:
     )
 
 
+def _clear_desktop_rebuild_pending_marker(desktop_dir: Path) -> None:
+    """Remove the nightly-pull desktop-rebuild marker after a successful build.
+
+    The WebUI's nightly agent-apply writes ``HERMES_HOME/.hermes-desktop-
+    rebuild-pending`` when a ``git pull`` advanced ``apps/desktop/`` source
+    (the pull cannot rebuild the running desktop). The desktop checks the
+    marker at startup and hands off to ``hermes update``; once that rebuild
+    succeeds, this clears the marker so the next launch is clean.
+
+    ``desktop_dir`` is ``HERMES_HOME/hermes-agent/apps/desktop``, so
+    ``desktop_dir.parent.parent.parent`` is exactly HERMES_HOME — no
+    env/registry resolution variance between writer and consumer.
+    """
+    try:
+        marker = desktop_dir.parent.parent.parent / ".hermes-desktop-rebuild-pending"
+        if marker.exists():
+            marker.unlink()
+            print("  ✓ Cleared desktop rebuild-pending marker (nightly pull flag)")
+    except OSError as exc:
+        print(f"  ⚠ Could not clear desktop rebuild-pending marker: {exc}")
+
+
 def _rebuild_desktop_after_update(
     desktop_dir: Path, *, had_desktop_app_before_update: bool
 ) -> bool:
@@ -5828,6 +5850,11 @@ def _rebuild_desktop_after_update(
         print(f"  Full build log: {_dhh()}/logs/update.log")
         return False
     print("  ✓ Desktop app up to date")
+    # The bundle now matches the source tree, so the rebuild-pending marker
+    # (written by the nightly WebUI agent-apply when a pull advanced
+    # apps/desktop/ source) is stale. Consume it so the desktop does not
+    # re-trigger its update hand-off on the next launch.
+    _clear_desktop_rebuild_pending_marker(desktop_dir)
     return True
 
 

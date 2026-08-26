@@ -433,6 +433,11 @@ export interface ModelCapabilities {
   can_disable_reasoning?: boolean
   fast: boolean
   reasoning: boolean
+  /** Wire-accepted reasoning-effort levels for this model, when the provider
+   *  declares a subset of the generic ladder. Absent/undefined means the
+   *  generic ladder applies. Lets the settings panel offer exactly the
+   *  efforts the transport will honor instead of phantom tiers. */
+  supported_efforts?: string[]
 }
 
 export interface ModelOptionsResponse {

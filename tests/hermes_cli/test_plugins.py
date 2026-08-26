@@ -1636,6 +1636,69 @@ class TestPluginManagerList:
         )
 
 
+class TestSharedRootUserPluginDiscovery:
+    """Profile-scoped processes must see user plugins from the SHARED root.
+
+    In profile mode HERMES_HOME resolves to ``<root>/profiles/<name>`` and
+    the profile's own ``plugins/`` dir is usually empty — user plugins are
+    installed in the shared hermes root's ``plugins/`` dir. Discovery scans
+    the shared root first, then the profile home, so a profile-local copy of
+    a same-named plugin wins the key collision (#87197 rule).
+    """
+
+    def test_profile_mode_discovers_root_user_plugin(self, tmp_path, monkeypatch):
+        """A plugin in <root>/plugins/ is discovered under profile HERMES_HOME."""
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            root / "plugins", "root-shared-plugin",
+            home=profile_home,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        listing = {p["name"]: p for p in mgr.list_plugins()}
+        assert "root-shared-plugin" in listing, (
+            "profile-scoped discovery must see user plugins installed in the "
+            "shared root plugins/ dir"
+        )
+
+    def test_profile_local_plugin_wins_over_root(self, tmp_path, monkeypatch):
+        """A same-named plugin in the profile home takes precedence."""
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            root / "plugins", "dupe",
+            register_body='ctx.register_cli_command("root-copy", "help", lambda: None, lambda: None)',
+            home=profile_home,
+        )
+        profile_dir = _make_plugin_dir(
+            profile_home / "plugins", "dupe",
+            register_body='ctx.register_cli_command("profile-copy", "help", lambda: None, lambda: None)',
+            home=profile_home,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        by_name = {p["name"]: p for p in mgr.list_plugins()}
+        assert "dupe" in by_name
+        # The loaded plugin's module must be the profile copy, not the root one.
+        loaded = mgr._plugins.get("dupe")
+        assert loaded is not None and loaded.enabled
+        # Registering CLI commands is observable via the manager's command map:
+        # the profile copy's command must be the one that registered, and the
+        # root copy's command must NOT be present (root copy never loaded).
+        cli_commands = getattr(mgr, "_cli_commands", {})
+        assert "profile-copy" in cli_commands
+        assert "root-copy" not in cli_commands
+
+
 class TestPreLlmCallTargetRouting:
     """Tests for pre_llm_call hook return format with target-aware routing.
 

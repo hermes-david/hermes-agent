@@ -319,6 +319,38 @@ describe('ModelSettings', () => {
     expect(screen.queryByRole('switch')).toBeNull()
   })
 
+  it('filters the reasoning dropdown to the model supported_efforts', async () => {
+    getGlobalModelInfo.mockResolvedValue({ provider: 'ollama-cloud', model: 'deepseek-v4-flash:cloud' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Ollama Cloud',
+          slug: 'ollama-cloud',
+          models: ['deepseek-v4-flash:cloud'],
+          authenticated: true,
+          capabilities: {
+            'deepseek-v4-flash:cloud': { reasoning: true, fast: false, supported_efforts: ['high', 'max', 'none'] }
+          }
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    await waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalled())
+
+    // The reasoning Select is among the page's comboboxes; open it.
+    const selects = screen.getAllByRole('combobox')
+    const reasoningSelect = selects.find(s => s.textContent?.includes('Reasoning')) ?? selects[selects.length - 1]
+    fireEvent.click(reasoningSelect)
+
+    // Only the supported efforts are offered — phantom tiers are absent.
+    expect(await screen.findByRole('option', { name: 'High' })).toBeTruthy()
+    expect(await screen.findByRole('option', { name: 'Max' })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'Minimal' })).toBeNull()
+    expect(screen.queryByRole('option', { name: 'Low' })).toBeNull()
+    expect(screen.queryByRole('option', { name: 'Extra High' })).toBeNull()
+  })
+
   it('renders the auxiliary task rows', async () => {
     await renderModelSettings()
 

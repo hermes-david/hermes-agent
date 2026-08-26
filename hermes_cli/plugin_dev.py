@@ -188,6 +188,17 @@ def resolve_plugin_path(target: str | os.PathLike[str] | None = None) -> Path:
     candidates: list[Path] = []
     user_root = get_hermes_home() / "plugins"
     candidates.append(user_root / raw)
+    # Profile mode: the active home is <root>/profiles/<name>, whose own
+    # plugins/ dir is usually empty — user plugins live in the SHARED root's
+    # plugins/ dir. Try it too, mirroring PluginManager discovery (#87197).
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        shared_root = get_default_hermes_root() / "plugins"
+        if shared_root.resolve(strict=False) != user_root.resolve(strict=False):
+            candidates.append(shared_root / raw)
+    except Exception:
+        pass
     try:
         from hermes_cli.plugins import get_bundled_plugins_dir
 

@@ -227,6 +227,28 @@ class TestOllamaModelSupportsThinking:
         )
 
 
+class TestOllamaCloudSupportedEfforts:
+    """``supported_reasoning_efforts`` reports the honest wire contract."""
+
+    def test_deepseek_v4_collapses_to_three_modes(self, ollama_cloud_profile):
+        assert ollama_cloud_profile.supported_reasoning_efforts(
+            "deepseek-v4-flash:cloud"
+        ) == ["high", "max", "none"]
+
+    def test_deepseek_v4_bare_and_dated_ids(self, ollama_cloud_profile):
+        assert ollama_cloud_profile.supported_reasoning_efforts(
+            "deepseek-v4-flash"
+        ) == ["high", "max", "none"]
+        assert ollama_cloud_profile.supported_reasoning_efforts(
+            "deepseek-v4-flash:0731-cloud"
+        ) == ["high", "max", "none"]
+
+    def test_non_deepseek_keeps_full_wire_set(self, ollama_cloud_profile):
+        assert ollama_cloud_profile.supported_reasoning_efforts(
+            "gemma3:27b"
+        ) == ["low", "medium", "high", "max", "none"]
+
+
 class TestOllamaCloudAuxModel:
     """Ollama Cloud aux model is set on the profile."""
 

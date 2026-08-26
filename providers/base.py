@@ -167,6 +167,18 @@ class ProviderProfile:
         """
         return {}, {}
 
+    def supported_reasoning_efforts(self, model: str | None = None) -> list[str] | None:
+        """Return the reasoning-effort levels this provider accepts on the wire.
+
+        ``None`` (default) means "unknown / generic ladder" — the caller falls
+        back to the standard VALID_REASONING_EFFORTS set. Providers whose
+        backend accepts a strict subset (e.g. Ollama Cloud's discrete
+        {low, medium, high, max, none} contract) override this so UIs can
+        advertise exactly what the transport will honor instead of offering
+        phantom tiers that 400 or silently no-op.
+        """
+        return None
+
     def default_vision_model(self) -> str | None:
         """Return a default vision model id for this provider, or None.
 

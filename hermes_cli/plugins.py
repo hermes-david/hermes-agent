@@ -4284,7 +4284,34 @@ class PluginManager:
         manifests.extend(bundled_platforms)
 
         # 2. User plugins (~/.hermes/plugins/)
+        #
+        # In profile mode (HERMES_HOME resolves to <root>/profiles/<name>),
+        # the active home is the profile directory, whose own plugins/ is
+        # usually empty — user plugins are installed in the SHARED hermes
+        # root's plugins/ dir. Scan the shared root first, then the profile
+        # home, so the profile-local copy of a same-named plugin wins the
+        # key collision (later manifests override earlier ones in
+        # _discover_and_load_inner, mirroring the "profile wins" rule used
+        # by _discover_dashboard_plugins, #87197). In non-profile mode the
+        # two paths resolve to the same directory and the extra scan is
+        # skipped — behavior is byte-identical to before.
         user_dir = get_hermes_home() / "plugins"
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            shared_root_dir = get_default_hermes_root() / "plugins"
+        except Exception:
+            shared_root_dir = None
+        if (
+            shared_root_dir is not None
+            and shared_root_dir.resolve(strict=False)
+            != user_dir.resolve(strict=False)
+        ):
+            logger.debug("Scanning shared root user plugins: %s", shared_root_dir)
+            root_manifests = self._scan_directory(shared_root_dir, source="user")
+            logger.debug("  shared-root user: %d manifest(s)", len(root_manifests))
+            manifests.extend(root_manifests)
+
         logger.debug("Scanning user plugins: %s", user_dir)
         user_manifests = self._scan_directory(user_dir, source="user")
         logger.debug("  user: %d manifest(s)", len(user_manifests))
