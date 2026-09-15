@@ -60,7 +60,9 @@ from hermes_cli.models_local import (
     _ollama_local_catalog,
     _ollama_probe_cache_key,
     _root_for_ollama_native_api,
-    fetch_ollama_cloud_models)
+    fetch_ollama_cloud_models,
+    filter_servable_ollama_cloud_models,
+    ollama_cloud_model_is_servable)
 
 logger = logging.getLogger(__name__)
 

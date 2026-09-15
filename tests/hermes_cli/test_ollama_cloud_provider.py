@@ -166,18 +166,226 @@ class TestOllamaCloudMergedDiscovery:
             }
         }
         with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b", "glm-5"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev), \
+             patch("hermes_cli.models.ollama_cloud_model_is_servable", return_value=True):
             result = fetch_ollama_cloud_models(force_refresh=True)
 
         # Live models first, then models.dev additions (deduped)
-        assert result[0] == "qwen3.5:397b"  # from live API
+        assert result[0] == "qwen3.5:397b"    # from live API
         assert result[1] == "glm-5"          # from live API (also in models.dev)
-        assert "kimi-k2.5" in result         # from models.dev only
-        assert "nemotron-3-super" in result  # from models.dev only
+        assert "kimi-k2.5" in result         # from models.dev only, servable
+        assert "nemotron-3-super" in result  # from models.dev only, servable
         assert result.count("glm-5") == 1    # no duplicates
 
-    def test_falls_back_to_models_dev_without_api_key(self, tmp_path, monkeypatch):
-        """Without API key, only models.dev results are returned."""
+
+class TestOllamaCloudRetiredModelFiltering:
+    """models.dev is a *gap-fill* source, not an additive one.
+
+    Ollama Cloud retires a model by removing it from ``/v1/models`` and returning HTTP 410
+    ("was retired at <date>") from every inference call. models.dev keeps listing it, so the
+    unconditional union served retired IDs in the picker: selecting one produced a hard 410
+    error rather than a usable model.
+    """
+
+    def _patch_servability(self, monkeypatch, servable_ids):
+        """Wire the /api/show servability probe to a fixed set of model IDs.
+
+        Patches the real seam (the probe helper), not the module under test.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.models.ollama_cloud_model_is_servable",
+            lambda model, *a, **k: model in servable_ids,
+        )
+
+    def test_retired_model_is_excluded_when_live_probe_succeeds(self, tmp_path, monkeypatch):
+        """A models.dev-only model the API refuses (410) must not be offered."""
+        from hermes_cli.models import fetch_ollama_cloud_models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        # kimi-k2.5 is retired upstream; deepseek-v4-flash is still served.
+        self._patch_servability(monkeypatch, {"deepseek-v4-flash"})
+
+        mock_mdev = {
+            "ollama-cloud": {
+                "models": {
+                    "kimi-k2.5": {"tool_call": True},
+                    "deepseek-v4-flash": {"tool_call": True},
+                }
+            }
+        }
+        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b"]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+            result = fetch_ollama_cloud_models(force_refresh=True)
+
+        assert "kimi-k2.5" not in result, (
+            "retired model must not reach the picker — selecting it 410s"
+        )
+        assert "deepseek-v4-flash" in result, (
+            "a servable models.dev-only model must survive the filter"
+        )
+        assert "qwen3.5:397b" in result, "live models must be preserved"
+
+    def test_live_models_are_not_probe_filtered(self, tmp_path, monkeypatch):
+        """Live /v1/models is already authoritative — never probe-filter it.
+
+        The probe returns False for everything here. Live models must still survive: a
+        transient probe fault must not silently shrink the catalog.
+        """
+        from hermes_cli.models import fetch_ollama_cloud_models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        self._patch_servability(monkeypatch, set())
+
+        mock_mdev = {"ollama-cloud": {"models": {"kimi-k2.5": {"tool_call": True}}}}
+        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b", "glm-5"]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+            result = fetch_ollama_cloud_models(force_refresh=True)
+
+        assert result == ["qwen3.5:397b", "glm-5"]
+
+    def test_live_failure_keeps_models_dev_fallback_unfiltered(self, tmp_path, monkeypatch):
+        """With no live catalog there is nothing to validate against.
+
+        Keep today's behaviour: serve the models.dev set so an authenticated user still gets
+        a usable picker during a transient outage.
+        """
+        from hermes_cli.models import fetch_ollama_cloud_models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        self._patch_servability(monkeypatch, set())
+
+        mock_mdev = {"ollama-cloud": {"models": {"kimi-k2.5": {"tool_call": True}}}}
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+            result = fetch_ollama_cloud_models(force_refresh=True)
+
+        assert result == ["kimi-k2.5"]
+
+class TestOllamaCloudServabilityProbe:
+    """The /api/show status mapping that decides servability.
+
+    These run at the real boundary (httpx.Client), mirroring the established probe-test
+    pattern, so the status-code mapping itself is covered rather than mocked away.
+    """
+
+    def _patch_show(self, monkeypatch, *, status=200, raise_exc=None):
+        import httpx
+
+        class _Resp:
+            status_code = status
+
+            def json(self):
+                return {}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, *a, **k):
+                if raise_exc:
+                    raise raise_exc
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "Client", _Client)
+
+    def test_status_200_is_servable(self, monkeypatch):
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        self._patch_show(monkeypatch, status=200)
+        assert ollama_cloud_model_is_servable(
+            "deepseek-v4-flash", "https://ollama.com/v1", "k") is True
+
+    def test_status_410_retired_is_not_servable(self, monkeypatch):
+        """410 = '<model> was retired at <date>' — the reported bug."""
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        self._patch_show(monkeypatch, status=410)
+        assert ollama_cloud_model_is_servable(
+            "kimi-k2.5", "https://ollama.com/v1", "k") is False
+
+    def test_status_404_unknown_is_not_servable(self, monkeypatch):
+        """404 = 'model <id> not found' — also unservable."""
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        self._patch_show(monkeypatch, status=404)
+        assert ollama_cloud_model_is_servable(
+            "no-such-model", "https://ollama.com/v1", "k") is False
+
+    def test_transport_failure_fails_open(self, monkeypatch):
+        """A transient probe fault must never drop a candidate."""
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        self._patch_show(monkeypatch, raise_exc=RuntimeError("boom"))
+        assert ollama_cloud_model_is_servable(
+            "kimi-k2.6", "https://ollama.com/v1", "k") is True
+
+    def test_strips_v1_suffix_for_native_endpoint(self, monkeypatch):
+        """The probe must hit <root>/api/show, not <root>/v1/api/show."""
+        import httpx
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        seen = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, *a, **k):
+                seen["url"] = url
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "Client", _Client)
+        ollama_cloud_model_is_servable("kimi-k2.6", "https://ollama.com/v1", "k")
+        assert seen["url"] == "https://ollama.com/api/show"
+
+
+class TestOllamaCloudServableFilter:
+    """filter_servable_ollama_cloud_models — fan-out + ordering."""
+
+    def test_preserves_order_and_duplicates(self, monkeypatch):
+        from hermes_cli.models import filter_servable_ollama_cloud_models
+
+        monkeypatch.setattr(
+            "hermes_cli.models.ollama_cloud_model_is_servable",
+            lambda m, *a, **k: m != "retired",
+        )
+        assert filter_servable_ollama_cloud_models(
+            ["a", "retired", "b", "a"]) == ["a", "b", "a"]
+
+    def test_empty_input(self):
+        from hermes_cli.models import filter_servable_ollama_cloud_models
+
+        assert filter_servable_ollama_cloud_models([]) == []
+
+
+class TestOllamaCloudModelsDevFallback:
+    def test_models_dev_only_when_live_unavailable(self, tmp_path, monkeypatch):
+        """models.dev supplies the catalog when the live probe returns nothing.
+
+        The probe is still ATTEMPTED without an env key — the catalog is anonymous — so it
+        is mocked to an empty result here to represent an unreachable endpoint.
+        """
         from hermes_cli.models import fetch_ollama_cloud_models
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -190,7 +398,8 @@ class TestOllamaCloudMergedDiscovery:
                 }
             }
         }
-        with patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
             result = fetch_ollama_cloud_models(force_refresh=True)
 
         assert result == ["glm-5"]

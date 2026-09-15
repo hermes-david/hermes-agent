@@ -652,6 +652,74 @@ def _save_ollama_cloud_cache(models: list[str]) -> None:
         pass
 
 
+def ollama_cloud_model_is_servable(
+    model: str,
+    base_url: Optional[str] = None,
+    api_key: object = None,
+    timeout: float = 5.0,
+) -> bool:
+    """True when the provider will actually serve ``model`` (native ``/api/show`` probe).
+
+    Answers authoritatively for models the OpenAI-compatible ``/v1/models`` listing omits:
+    ``200`` servable; ``410`` ``"<model> was retired at <date>"``; ``404`` unknown id/tag.
+    Only 410/404 are treated as "not servable" — transport faults return True so a transient
+    probe failure can never silently shrink the catalog. Generates no tokens, unlike a
+    ``chat/completions`` probe.
+    """
+    import httpx
+
+    server_url = (base_url or "").strip().rstrip("/")
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+    if not server_url:
+        return True  # nothing to probe against — don't drop on missing config
+
+    bare_model = _strip_ollama_cloud_suffix((model or "").strip())
+    if not bare_model:
+        return False
+
+    from agent.command_token_source import materialize_probe_api_key
+    token = materialize_probe_api_key(api_key)
+    try:
+        with httpx.Client(timeout=timeout, headers={"Authorization": f"Bearer {token}"} if token else {}) as client:
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            return resp.status_code not in (404, 410)
+    except Exception:
+        return True  # transient — fail open, keep the candidate
+
+
+def filter_servable_ollama_cloud_models(
+    models: list[str],
+    *,
+    base_url: Optional[str] = None,
+    api_key: object = None,
+    max_workers: int = 8,
+) -> list[str]:
+    """Drop entries from *models* the provider will not serve.
+
+    Bounded fan-out over :func:`ollama_cloud_model_is_servable`; order and duplicates
+    preserved. Only the models.dev gap-fill candidates (a handful) are ever probed, never the
+    live catalog, so this stays cheap.
+    """
+    if not models:
+        return []
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Call-time lookup so patch("hermes_cli.models.ollama_cloud_model_is_servable")
+        # intercepts (this module's documented mock contract).
+        from hermes_cli.models import ollama_cloud_model_is_servable
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(models))) as pool:
+            verdicts = list(pool.map(
+                lambda m: ollama_cloud_model_is_servable(m, base_url=base_url, api_key=api_key),
+                models,
+            ))
+    except Exception:
+        return list(models)  # thread scaffolding failed — don't drop anything
+    return [m for m, ok in zip(models, verdicts) if ok]
+
+
 def fetch_ollama_cloud_models(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -659,7 +727,7 @@ def fetch_ollama_cloud_models(
     force_refresh: bool = False,
 ) -> list[str]:
     """Ollama Cloud models: fresh disk cache (< 1h, unless force_refresh) → live ``/v1/models``
-    (freshest) merged with models.dev additions (deduped, live first) → stale cache → ``[]``.
+    (freshest) merged with validated models.dev additions (deduped, live first) → stale cache → ``[]``.
     Never None."""
     from hermes_cli.models import fetch_api_models
     if not force_refresh:
@@ -669,6 +737,9 @@ def fetch_ollama_cloud_models(
 
     api_key = api_key or os.getenv("OLLAMA_API_KEY", "")
     base_url = base_url or os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+    # Probe only with a credential. Hermes deliberately does not touch an endpoint it cannot
+    # authenticate to (the keyless-endpoint network-cost gate); ollama.com serving its public
+    # catalog anonymously does not justify relaxing that policy here.
     live_models = (fetch_api_models(api_key, base_url, timeout=8.0) or []) if api_key else []
     mdev_models: list[str] = []
     try:
@@ -678,9 +749,34 @@ def fetch_ollama_cloud_models(
         pass
 
     merged: list[str] = []
-    for m in [*live_models, *(_strip_ollama_cloud_suffix(m) for m in mdev_models)]:
+    for m in live_models:
         if m and m not in merged:
             merged.append(m)
+
+    # models.dev gap-fill candidates (ids already covered by live removed)
+    candidates: list[str] = []
+    seen = set(merged)
+    for m in mdev_models:
+        normalized = _strip_ollama_cloud_suffix(m)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(normalized)
+
+    # models.dev is a GAP-FILL source, not an additive one. A successful live probe is
+    # authoritative for what this account can call, so each candidate is validated first.
+    # Unvalidated entries surfaced in the picker as dead options: Ollama Cloud retires a model
+    # by dropping it from /v1/models and returning HTTP 410 from inference, while models.dev
+    # keeps listing it, so selecting one produced a hard 410 error. With no live catalog there
+    # is nothing to validate against (and the failure may be transient), so the models.dev
+    # fallback is served unfiltered exactly as before.
+    if live_models:
+        # Look up the filter on ``hermes_cli.models`` at call time so
+        # ``patch("hermes_cli.models.<name>")`` mocks keep intercepting (same convention
+        # as the other helpers in this module).
+        from hermes_cli.models import filter_servable_ollama_cloud_models
+        candidates = filter_servable_ollama_cloud_models(candidates, base_url=base_url, api_key=api_key)
+    merged.extend(candidates)
+
     if merged:
         _save_ollama_cloud_cache(merged)
         return merged
