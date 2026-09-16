@@ -410,6 +410,13 @@ class GatewayBusySessionMixin:
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
         else:
             message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+        # Email is final-answer-only (user rule 2026-08-25): drain notices are per-turn
+        # transport chatter and must never be emailed. The queueing above still has to run —
+        # it is what preserves the user's message across the restart — so only the SEND is
+        # suppressed here, never the admission.
+        if event.source.platform == Platform.EMAIL:
+            logger.debug("Busy drain notice suppressed for email session %s", session_key)
+            return
         await self._send_busy_reply(event, adapter, message)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
@@ -731,6 +738,16 @@ class GatewayBusySessionMixin:
         # stamps the "last ack" timestamp.
         if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
             logger.debug("Busy ack suppressed for session %s", session_key)
+            return True  # input still processed, just no ack sent
+
+        # Email is final-answer-only (user rule 2026-08-25): busy-acks
+        # ("Redirected current run", "Steered into current run", queue
+        # notices) are per-turn chatter and must never be emailed. The
+        # display.platforms.email.busy_ack_detail: false override only
+        # trims the detail suffix — it does not suppress the ack itself,
+        # so gate the whole ack on the platform here.
+        if event.source.platform == Platform.EMAIL:
+            logger.debug("Busy ack suppressed for email session %s", session_key)
             return True  # input still processed, just no ack sent
 
         # Debounce (30s) before the config-heavy display lookup.

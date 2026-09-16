@@ -4064,10 +4064,26 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         with _kbc.connect_closing() as c:
             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
 
+    def _event(kind: str, payload: Optional[dict] = None) -> None:
+        # (local patch) Per-turn judge verdicts land in the task event log so the
+        # board (and humans) can see WHY the loop continued / blocked, not just
+        # the terminal state. Best-effort: a locked DB must not wedge the loop.
+        c = _kb.connect()
+        try:
+            _kb.record_task_event(c, task_id, kind, payload, run_id=worker_run_id)
+        except Exception:
+            pass
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=_run_turn, task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        event_fn=_event,
     )
 
 

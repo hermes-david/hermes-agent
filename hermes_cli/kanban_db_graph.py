@@ -196,15 +196,25 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    # Local patch: deterministic goal-mode policy for decomposed children. An
+    # implementation-profile child (coder/designer/debug) gets goal_mode=True so
+    # the aux judge re-evaluates its output against the card after each turn and
+    # keeps the SAME session going until done or the budget is exhausted;
+    # everything else stays a plain single-shot card. The child dict carries
+    # these from the decomposer's policy (see kanban_decompose.GOAL_MODE_ASSIGNEES).
+    goal_max_turns = child.get("goal_max_turns")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, "
+        " goal_mode, goal_max_turns) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
             root_row["tenant"], now, (author or "decomposer"),
+            1 if child.get("goal_mode") else 0,
+            int(goal_max_turns) if goal_max_turns is not None else None,
         ),
     )
     _append_event(

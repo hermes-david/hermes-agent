@@ -835,6 +835,14 @@ class TurnRunner:
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+        # Email is final-answer-only (user rule 2026-08-25): per-turn status chatter must
+        # never be emailed. Two callers route here — interim assistant messages and the
+        # background self-improvement review notice ("💾 Self-improvement review: ..."),
+        # which arrived as a standalone email on 2026-09-16. `display.platforms.email.
+        # interim_assistant_messages: false` covers only the first, so gate the send.
+        if getattr(self._ctx.source, "platform", None) == Platform.EMAIL:
+            logger.debug("Status text suppressed for email session (%s)", log_message)
+            return
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 

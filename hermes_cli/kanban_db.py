@@ -1859,6 +1859,22 @@ def _append_event(
     )
 
 
+def record_task_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Record a task event in its own write transaction.
+
+    Public counterpart of the txn-internal :func:`_append_event` for callers that
+    run OUTSIDE an open write transaction — e.g. the kanban goal loop recording
+    per-turn judge verdicts from the worker process. (local patch: re-ported onto
+    the v2026.9.14 kanban_db split; upstream has no equivalent, so the goal-loop
+    event wiring calls through here.)
+    """
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,

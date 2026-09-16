@@ -660,6 +660,18 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
+    # Email is final-answer-only (user rule 2026-08-25): the agent status channel carries
+    # per-turn diagnostics ("⚠ auxiliary.background_review.reasoning_effort=... has no effect
+    # while the review runs on the main model", compression notices, provider-error replies),
+    # and on email each arrives as its own standalone message that fragments the thread.
+    # Chat surfaces keep them; email gets the final answer only. This is the single funnel for
+    # agent `_emit_status` / `_emit_warning` callbacks, so one gate covers every such notice.
+    # Turn FAILURES do not ride this channel — they surface as the final response
+    # (`run_turn_runner` builds `f"⚠️ {result['error']}"`), so nothing actionable is lost.
+    if _gateway_platform_value(platform) == "email":
+        logger.debug("Agent status message suppressed for email (event=%s)", event_type)
+        return None
+
     text = _redact_gateway_user_facing_secrets(text)
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (

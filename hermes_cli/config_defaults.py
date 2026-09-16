@@ -1774,6 +1774,13 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # (local patch) Per-child goal-loop turn budget the decomposer stamps on
+        # implementation children (coder/designer/debug assignees), which are
+        # created with goal_mode=True so the goal judge gates their completion.
+        # Mirrors the goals-engine default (20). Other child types are
+        # single-shot cards and ignore this. 0/negative/unset fall back to the
+        # goals-engine default.
+        "decomposer_goal_max_turns": 20,
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

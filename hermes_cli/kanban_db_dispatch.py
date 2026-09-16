@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -1204,12 +1205,31 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception (local patch): an explicit re-queue AFTER the PR comment
+    #    (operator unblock / promote / status change / reclaim) is a deliberate
+    #    "run it again" — honor it instead of deferring. Without this, a human
+    #    unblocking a PR-blocked card just sits there, silently held by the
+    #    guard, until the 24h window elapses. Mirrors the bypass the
+    #    recent_success check applies to completed runs above.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            latest_pr_at = max(latest_pr_at or 0, int(c["created_at"]))
+    if latest_pr_at is not None:
+        requeued_after_pr = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, latest_pr_at),
+        ).fetchone()
+        if not requeued_after_pr:
             return "active_pr"
 
     return None
@@ -1227,8 +1247,16 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+    """True when a claimable row exists that the dispatcher would actually spawn.
+
+    Local patch: rows the respawn guard is deliberately holding do NOT count as
+    spawnable. Without this check, a correctly-deferred queue (e.g. a PR-blocked
+    card inside the 24h ``active_pr`` window) fired the "dispatcher stuck"
+    warning every 5 minutes forever even though the dispatcher was behaving
+    exactly as designed (650+ false ticks observed on the 2026-09-07 dev board).
+    """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
@@ -1238,7 +1266,11 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(
+        profile_exists(row["assignee"])
+        and check_respawn_guard(conn, row["id"], lane=status) is None
+        for row in rows
+    )
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1533,8 +1565,29 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
+            # Local patch: emit the event only when the reason CHANGES. A task
+            # held by a long-window guard (e.g. active_pr, 24h) would otherwise
+            # accumulate one identical row per tick — hundreds of rows that
+            # drown the event feed and bloat the DB (650+ observed 2026-09-07).
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                last = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'respawn_guarded' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                try:
+                    last_reason = (
+                        json.loads(last["payload"]).get("reason")
+                        if last and last["payload"]
+                        else None
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    last_reason = None
+                if last_reason != guard_reason:
+                    _kb._append_event(
+                        conn, task_id, "respawn_guarded", {"reason": guard_reason}
+                    )
         return False
 
     def _count_spawn(name: str) -> None:

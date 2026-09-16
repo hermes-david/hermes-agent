@@ -803,7 +803,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, conn=None):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
@@ -837,6 +837,19 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
         _logging.getLogger(__name__).warning("goal judge check failed, allowing lifecycle handoff: %s",
                                              judge_exc, exc_info=True)
+    if verdict != "done" and conn is not None and task is not None:
+        # (local patch) Record the handoff-gate verdict in the task event log so
+        # a rejected completion/review is auditable on the board, not just in
+        # the worker's stderr. Best-effort: never wedge the handoff.
+        try:
+            kb.record_task_event(
+                conn,
+                task.id,
+                "goal_judged",
+                {"verdict": verdict, "reason": reason[:400], "gate": "handoff"},
+            )
+        except Exception:
+            pass
     return (verdict, None if verdict == "done" else reason)
 
 
@@ -845,7 +858,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
+    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, conn=conn)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")

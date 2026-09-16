@@ -191,6 +191,38 @@ class _Routing:
     auto_promote: bool
     roster: list[dict]
     valid_names: set[str]
+    goal_max_turns: "int | None" = None
+
+
+# Local patch: profiles whose decomposed children get goal_mode=True. The aux
+# judge re-evaluates the worker's output against the card (title/body) after
+# each turn and keeps the SAME session going until done or the turn budget is
+# exhausted. Implementation work (code, design, debugging) benefits from that
+# iterative gating; docs/evolve/orchestrate children stay plain single-shot
+# cards by policy.
+#
+# Deliberate exclusion: architect (review) cards are NOT goal-mode. The judge
+# also gates kanban_request_review, so a goal-mode architect card could not hand
+# a spec/plan off for review without first passing the aux judge —
+# premature-completion rejection on open-ended design work adds friction where
+# the orchestrator/human reviewer should be the arbiter.
+GOAL_MODE_ASSIGNEES = frozenset({"coder", "designer", "debug"})
+
+# Fallback turn budget when ``kanban.decomposer_goal_max_turns`` is unset in
+# config. Mirrors goals.DEFAULT_MAX_TURNS.
+DEFAULT_GOAL_MAX_TURNS = 20
+
+
+def _resolve_goal_max_turns(kanban_cfg: dict) -> int:
+    """Turn budget for goal-mode children (``kanban.decomposer_goal_max_turns``).
+
+    Falls back to the goals-engine default. The goal_judge model/config is
+    deliberately untouched by this policy.
+    """
+    val = kanban_cfg.get("decomposer_goal_max_turns") if isinstance(kanban_cfg, dict) else None
+    if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+        return val
+    return DEFAULT_GOAL_MAX_TURNS
 
 
 def _load_routing() -> _Routing:
@@ -207,6 +239,7 @@ def _load_routing() -> _Routing:
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
+        goal_max_turns=_resolve_goal_max_turns(kanban_cfg),
     )
 
 
@@ -259,6 +292,13 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
+            # Local patch: deterministic goal-mode policy, keyed on the *resolved*
+            # assignee (after the invalid-name fallback rewrite above) — so a
+            # typo'd assignee routed to the default gets the default's policy,
+            # not the typo's. The goal loop and the handoff gates read the same
+            # card title/body, so the judge checks output against exactly this.
+            "goal_mode": chosen in GOAL_MODE_ASSIGNEES,
+            "goal_max_turns": routing.goal_max_turns if chosen in GOAL_MODE_ASSIGNEES else None,
         })
     return children, ""
 

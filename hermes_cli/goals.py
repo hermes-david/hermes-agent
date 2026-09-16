@@ -1608,6 +1608,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    event_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1615,12 +1616,23 @@ def run_kanban_goal_loop(
     ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
     (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
     as CONTINUE (workers finish via kanban tools, not by parking).
+
+    ``event_fn(kind, payload)`` (local patch) persists per-turn judge verdicts into the task event
+    log so the board shows WHY the loop continued/blocked, not just the terminal state. It is
+    best-effort: a failure never wedges the loop.
     """
 
     def _log(msg: str) -> None:
         if log is not None:
             try:
                 log(msg)
+            except Exception:
+                pass
+
+    def _event(kind: str, payload: Optional[dict] = None) -> None:
+        if event_fn is not None:
+            try:
+                event_fn(kind, payload)
             except Exception:
                 pass
 
@@ -1662,6 +1674,17 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+        # (local patch) Record the per-turn verdict so the board shows WHY the
+        # loop continued/blocked, not just the terminal state.
+        _event(
+            "goal_judged",
+            {
+                "verdict": verdict,
+                "reason": _truncate(reason, 400),
+                "turn": turns_used,
+                "max_turns": max_turns,
+            },
+        )
 
         if verdict == "blocked":
             # Unachievable is NOT done: block the card with the judge's reason now instead of

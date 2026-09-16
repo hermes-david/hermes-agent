@@ -612,6 +612,86 @@ def ollama_model_supports_thinking(
 _OLLAMA_CLOUD_CACHE_TTL = 3600  # 1 hour
 
 
+def ollama_cloud_model_is_servable(
+    model: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+) -> bool:
+    """Return True when the provider will actually serve *model*.
+
+    Probes the native ``/api/show`` endpoint. This answers authoritatively for
+    models the OpenAI-compatible ``/v1/models`` listing omits entirely:
+
+      * ``200`` — the model exists and is callable.
+      * ``410`` — ``"<model> was retired at <date>"``. Third-party catalogs
+        (models.dev) keep listing these indefinitely, but every inference call
+        fails, so offering one in the picker is a dead option.
+      * ``404`` — unknown model ID / tag.
+
+    Only 410 and 404 are treated as authoritative "not servable". Transport
+    faults (timeout, connection error, unexpected status) return True, so a
+    transient probe failure never silently shrinks the catalog.
+
+    Generates no tokens, unlike a ``chat/completions`` probe.
+    """
+    import httpx
+
+    server_url = (base_url or "").strip().rstrip("/")
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+    if not server_url:
+        return True  # nothing to probe against — don't drop on missing config
+
+    bare_model = _strip_ollama_cloud_suffix((model or "").strip())
+    if not bare_model:
+        return False
+
+    token = str(api_key or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    try:
+        with httpx.Client(timeout=timeout, headers=headers) as client:
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            if resp.status_code in (404, 410):
+                return False
+            return True
+    except Exception:
+        return True  # transient — fail open, keep the candidate
+
+
+def filter_servable_ollama_cloud_models(
+    models: list[str],
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_workers: int = 8,
+) -> list[str]:
+    """Drop entries from *models* the provider will not serve.
+
+    Bounded fan-out over :func:`ollama_cloud_model_is_servable`, order and
+    duplicates preserved. Probing only ever applies to the models.dev gap-fill
+    candidates (a handful), never the live catalog, so this stays cheap.
+    """
+    if not models:
+        return []
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(models))) as pool:
+            verdicts = list(
+                pool.map(
+                    lambda m: ollama_cloud_model_is_servable(
+                        m, base_url=base_url, api_key=api_key
+                    ),
+                    models,
+                )
+            )
+    except Exception:
+        return list(models)  # thread scaffolding failed — don't drop anything
+    return [m for m, ok in zip(models, verdicts) if ok]
+
+
 def _strip_ollama_cloud_suffix(model_id: str) -> str:
     """Strip the ``:cloud`` / ``-cloud`` suffix models.dev appends to Ollama Cloud IDs (the live
     API uses bare ids), so the dedup merge does not produce duplicates."""
@@ -678,9 +758,38 @@ def fetch_ollama_cloud_models(
         pass
 
     merged: list[str] = []
-    for m in [*live_models, *(_strip_ollama_cloud_suffix(m) for m in mdev_models)]:
+    for m in live_models:
         if m and m not in merged:
             merged.append(m)
+
+    # models.dev is a GAP-FILL source, not an additive one. A successful live
+    # probe is authoritative for what this account can call, so each gap-fill
+    # candidate is validated against the provider before being offered.
+    # Unvalidated entries surfaced in the picker as dead options: Ollama Cloud
+    # retires a model by dropping it from /v1/models and returning HTTP 410
+    # from inference, while models.dev keeps listing it indefinitely, so
+    # selecting one produced a hard 410 instead of a usable model.
+    #
+    # With no live catalog there is nothing to validate against (and the
+    # failure may be transient), so the models.dev fallback is served
+    # unfiltered exactly as before. Transport faults fail open for the same
+    # reason. Probing only ever touches the gap-fill candidates (a handful),
+    # never the live catalog, so this stays cheap.
+    candidates: list[str] = []
+    for m in mdev_models:
+        normalized = _strip_ollama_cloud_suffix(m)
+        if normalized and normalized not in merged and normalized not in candidates:
+            candidates.append(normalized)
+
+    if live_models and candidates:
+        candidates = filter_servable_ollama_cloud_models(
+            candidates, base_url=base_url, api_key=api_key
+        )
+
+    for m in candidates:
+        if m and m not in merged:
+            merged.append(m)
+
     if merged:
         _save_ollama_cloud_cache(merged)
         return merged

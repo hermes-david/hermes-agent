@@ -775,6 +775,14 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
+        # Email is final-answer-only (user rule 2026-08-25): these notices describe the
+        # current turn's compression housekeeping, and on email each one arrives as its own
+        # standalone message that fragments the thread while the actual answer is still
+        # coming — e.g. "Context compression deferred — summary still streaming". Same class
+        # as the email busy-ack gate in `_should_send_busy_ack`; chat surfaces keep them.
+        if source.platform == Platform.EMAIL:
+            logger.debug("Hygiene notice suppressed for email session (what=%s)", what)
+            return
         try:
             _adapter = self._adapter_for_source(source)
             if _adapter and source.chat_id:

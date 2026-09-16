@@ -33,6 +33,100 @@ from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_p
 
 logger = logging.getLogger(__name__)
 
+# Inline CSS for rendered HTML email bodies (house customization: HTML-only
+# email, re-applied after upstream updates when the house patch conflicts).
+_EMAIL_HTML_CSS = (
+    "body{font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;line-height:1.55;margin:0}"
+    "pre{background:#f4f4f4;border:1px solid #ddd;border-radius:4px;padding:10px;overflow-x:auto;font-size:13px}"
+    "code{background:#f4f4f4;padding:1px 4px;border-radius:3px}"
+    "blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:10px;color:#555}"
+    "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}"
+    "th{background:#eee}h1,h2,h3{color:#111}"
+)
+
+
+# Bare http(s) URLs for autolinking. Python-Markdown alone does NOT autolink bare URLs
+# (pymdownx/linkify_it are not installed), so "Links: https://x/y" rendered as dead text.
+# Chat clients autolink on display; MAIL clients do not — so a bare URL in an email body
+# is unclickable. The negative lookbehind keeps us off URLs already inside an attribute.
+_BARE_URL_RE = re.compile(r"""(?<![\"'=/>])\bhttps?://[^\s<>\"')\]]+""")
+_TRAILING_PUNCT = ".,;:!?"
+
+
+def _linkify_text(text: str) -> str:
+    """Wrap bare URLs in ``<a href>``; trailing sentence punctuation stays outside the link."""
+    def _sub(match: "re.Match[str]") -> str:
+        url = match.group(0)
+        trail = ""
+        while url and url[-1] in _TRAILING_PUNCT:
+            trail = url[-1] + trail
+            url = url[:-1]
+        if not url:
+            return match.group(0)
+        return f'<a href="{url}">{url}</a>{trail}'
+
+    return _BARE_URL_RE.sub(_sub, text)
+
+
+def _autolink_html(html_body: str) -> str:
+    """Autolink bare URLs in the TEXT nodes of already-rendered HTML only.
+
+    Never inside ``<a>`` (existing href), ``<code>``/``<pre>`` (literal samples), so a
+    code block containing a URL is not turned into a link and an existing anchor is not
+    double-wrapped.
+    """
+    parts = re.split(r"(<[^>]+>)", html_body)
+    out: list = []
+    stack: list = []
+    for part in parts:
+        if part.startswith("<"):
+            name_match = re.match(r"</?\s*([a-zA-Z0-9]+)", part)
+            name = name_match.group(1).lower() if name_match else ""
+            if part.startswith("</"):
+                if stack and stack[-1] == name:
+                    stack.pop()
+            elif name in ("a", "code", "pre") and not part.endswith("/>"):
+                stack.append(name)
+            out.append(part)
+            continue
+        out.append(part if stack else _linkify_text(part))
+    return "".join(out)
+
+
+def _markdown_to_html(text: str) -> str:
+    """Render markdown (agent replies) to a safe HTML email body.
+
+    Falls back to a paragraph-wrapped plain-text pass when the markdown
+    renderer is unavailable, so email never fails hard on a missing dep.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    try:
+        import markdown as _md
+
+        html_body = _md.markdown(
+            body,
+            extensions=["tables", "fenced_code", "sane_lists", "nl2br"],
+            output_format="html",
+        )
+        # Python-Markdown does not autolink bare URLs; mail clients don't either, so
+        # "Links: https://x/y" would arrive as dead text. Linkify the rendered text nodes.
+        html_body = _autolink_html(html_body)
+    except Exception:  # pragma: no cover - defensive fallback
+        import html as _html
+
+        html_body = "".join(
+            f"<p>{_html.escape(line)}</p>" for line in body.splitlines() if line.strip()
+        )
+    return (
+        "<html><head><meta charset='utf-8'><style>"
+        + _EMAIL_HTML_CSS
+        + "</style></head><body>"
+        + html_body
+        + "</body></html>"
+    )
+
 _SECURITY_ALIASES = {"tls": "tls", "ssl": "tls", "implicit": "tls", "starttls": "starttls", "plain": "plain", "none": "plain"}
 # Automated senders (address substrings / bulk-mail headers) are silently ignored.
 _NOREPLY_PATTERNS = ("noreply", "no-reply", "no_reply", "donotreply", "do-not-reply", "mailer-daemon", "postmaster",
@@ -328,6 +422,11 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
 
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+
+    # Email has no practical per-message limit (50k declared in register());
+    # declare full-message delivery so gateway/delivery.py does NOT truncate
+    # long cron output at MAX_PLATFORM_OUTPUT (4000). (house customization)
+    splits_long_messages = True
 
     # Per-account seen-UID snapshot surviving adapter recreation: the reconnect watcher builds a FRESH
     # adapter per retry; without this connect(is_reconnect=True) would re-mark the mailbox seen and skip
@@ -679,7 +778,18 @@ class EmailAdapter(BasePlatformAdapter):
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            # HTML-only body (house customization): markdown rendered; plain part
+            # only as a defensive fallback when HTML rendering itself fails.
+            # _new_reply is the ONE builder behind _send_email,
+            # _send_email_with_attachment and _send_email_with_attachments.
+            if body:
+                try:
+                    msg.attach(MIMEText(_markdown_to_html(body), "html", "utf-8"))
+                except Exception:
+                    logger.debug("[Email] HTML body render failed, plain only", exc_info=True)
+                    msg.attach(MIMEText(body, "plain", "utf-8"))
+            else:
+                msg.attach(MIMEText(body, "plain", "utf-8"))
         return msg, msg_id, subject
 
     def _smtp_send(self, msg: MIMEMultipart) -> None:
@@ -780,7 +890,13 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     if not all([address, password, smtp_host]):
         return send_error("Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)")
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        # HTML-only body (house customization); plain fallback on render failure.
+        msg = MIMEMultipart("alternative")
+        try:
+            msg.attach(MIMEText(_markdown_to_html(message), "html", "utf-8"))
+        except Exception:
+            logger.debug("[Email] HTML body render failed, plain only", exc_info=True)
+            msg.attach(MIMEText(message, "plain", "utf-8"))
         for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
             msg[key] = value
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
